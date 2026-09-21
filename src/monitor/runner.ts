@@ -5,6 +5,7 @@ import type {
   DocumentSnapshot,
   NotificationTemplate,
   Recipient,
+  RunError,
   RunSummary,
   WikiMonitorConfig,
   WikiNode,
@@ -58,16 +59,23 @@ async function resolveEditorName(
   client: FeishuClient,
   token: string,
   openId?: string,
+  cache?: Map<string, string | undefined>,
 ): Promise<string | undefined> {
   if (!openId) return undefined
+  if (cache?.has(openId)) return cache.get(openId)
   const kv = new KvRepository(env)
   const cached = await kv.get<{ name: string }>(`user:${openId}`)
-  if (cached) return cached.name
+  if (cached) {
+    cache?.set(openId, cached.name)
+    return cached.name
+  }
   try {
     const user = await client.getUser(token, openId)
     await kv.put(`user:${openId}`, user, 60 * 60 * 24)
+    cache?.set(openId, user.name)
     return user.name
   } catch {
+    cache?.set(openId, openId)
     return openId
   }
 }
@@ -106,11 +114,14 @@ async function dispatchEvent(
   event: DocumentChangeEvent,
   recipients: Recipient[],
   template: NotificationTemplate,
-): Promise<{ notified: number; failed: number }> {
+): Promise<{ notified: number; failed: number; errors: RunError[] }> {
   const kv = new KvRepository(env)
   let notified = 0
   let failed = 0
-  await mapWithConcurrency(recipients, 3, async (recipient) => {
+  const errors: RunError[] = []
+  // Feishu IM has a tenant-level send rate limit. Serializing sends avoids
+  // turning one document update into a burst of concurrent message requests.
+  await mapWithConcurrency(recipients, 1, async (recipient) => {
     const idempotencyKey = `notify:${event.eventId}:${recipient.id}:${template.id}`
     if (await kv.get(idempotencyKey)) return
     try {
@@ -126,12 +137,29 @@ async function dispatchEvent(
       const uuid = (await sha256(`${event.eventId}:${recipient.id}:${template.id}`)).slice(0, 50)
       const messageId = await client.sendMessage(token, recipient, body, uuid)
       await kv.put(idempotencyKey, { messageId, sentAt: new Date().toISOString() }, 60 * 60 * 24 * 90)
+      console.info(JSON.stringify({
+        type: 'feishu_notification_sent',
+        eventId: event.eventId,
+        documentToken: event.documentToken,
+        recipientId: recipient.id,
+        messageId,
+      }))
       notified += 1
-    } catch {
+    } catch (error) {
       failed += 1
+      const reason = error instanceof Error ? error.message : String(error)
+      errors.push({ code: 'MESSAGE_SEND_FAILED', message: reason, documentToken: event.documentToken, recipientId: recipient.id })
+      console.error(JSON.stringify({
+        type: 'feishu_notification_failed',
+        eventId: event.eventId,
+        documentToken: event.documentToken,
+        recipientId: recipient.id,
+        recipientType: recipient.type,
+        error: reason,
+      }))
     }
   })
-  return { notified, failed }
+  return { notified, failed, errors }
 }
 
 async function scanMonitor(
@@ -150,6 +178,7 @@ async function scanMonitor(
   const documents = nodes.filter((node) => node.objType === 'docx')
   const nodeByToken = new Map(documents.map((node) => [node.objToken, node]))
   const currentDocumentTokens = new Set(documents.map((node) => node.objToken))
+  const editorNameCache = new Map<string, string | undefined>()
 
   for (const batch of chunks(documents, 200)) {
     const query = await client.batchQueryDocumentMeta(readToken, batch.map((node) => node.objToken))
@@ -166,15 +195,15 @@ async function scanMonitor(
       }
     }
 
-    for (const meta of query.metas) {
+    await mapWithConcurrency(query.metas, 6, async (meta) => {
       try {
         const node = nodeByToken.get(meta.documentToken)
-        if (!node) continue
+        if (!node) return
         run.scanned += 1
         const key = snapshotKey(monitor.id, meta.documentToken)
         const previous = await kv.get<DocumentSnapshot>(key)
         const lastEditTime = isoFromSeconds(meta.latestModifyTime)
-        const editorName = await resolveEditorName(env, client, readToken, meta.latestModifyUser)
+        const editorName = await resolveEditorName(env, client, readToken, meta.latestModifyUser, editorNameCache)
         const snapshot: DocumentSnapshot = {
           schemaVersion: 1,
           monitorId: monitor.id,
@@ -192,11 +221,11 @@ async function scanMonitor(
         if (!previous) {
           if (!monitor.notifyOnFirstScan) {
             await kv.put(key, snapshot)
-            continue
+            return
           }
         } else if (previous.lastEditTime === lastEditTime || lastEditTime < previous.lastEditTime) {
           await kv.put(key, snapshot)
-          continue
+          return
         }
 
         const baseline = previous || { ...snapshot, lastEditTime: '' }
@@ -209,8 +238,8 @@ async function scanMonitor(
         const dispatch = await dispatchEvent(env, client, notificationToken, event, recipients, template)
         run.notified += dispatch.notified
         run.failed += dispatch.failed
-        if (dispatch.failed) {
-          run.errors.push({ code: 'MESSAGE_SEND_FAILED', message: `${dispatch.failed} 个接收人发送失败`, documentToken: meta.documentToken })
+        if (dispatch.errors.length) {
+          run.errors.push(...dispatch.errors)
         } else {
           await kv.put(key, snapshot)
         }
@@ -219,7 +248,7 @@ async function scanMonitor(
         run.failed += 1
         run.errors.push({ code: appError.code, message: appError.message, documentToken: meta.documentToken })
       }
-    }
+    })
   }
 
   // Only mark removals after a complete traversal and all metadata pages succeeded.
@@ -237,6 +266,8 @@ async function scanMonitor(
 
 export async function runWikiMonitor(env: CloudflareBindings, input: MonitorRunInput): Promise<RunSummary> {
   const runs = new RunRepository(env)
+  const lockTtlSeconds = Math.max(60, Number(env.MONITOR_LOCK_TTL_SECONDS || 600))
+  await runs.markStaleRunning(lockTtlSeconds * 1000)
   const run: RunSummary = {
     schemaVersion: 1,
     runId: input.runId || randomId('run'),
@@ -251,7 +282,18 @@ export async function runWikiMonitor(env: CloudflareBindings, input: MonitorRunI
   }
   await runs.put(run)
   const lock = new MonitorLock(env)
-  if (!(await lock.tryAcquire(run.runId))) {
+  let lockAcquired = false
+  try {
+    lockAcquired = await lock.tryAcquire(run.runId)
+  } catch (error) {
+    run.status = 'failed'
+    run.finishedAt = new Date().toISOString()
+    run.failed += 1
+    run.errors.push({ code: 'KV_WRITE_FAILED', message: error instanceof Error ? error.message : String(error) })
+    await runs.put(run)
+    return run
+  }
+  if (!lockAcquired) {
     run.status = 'skipped'
     run.finishedAt = new Date().toISOString()
     run.errors.push({ code: 'MONITOR_LOCKED', message: '已有扫描任务正在运行' })
@@ -304,8 +346,29 @@ export async function runWikiMonitor(env: CloudflareBindings, input: MonitorRunI
     run.errors.push({ code: appError.code, message: appError.message })
   } finally {
     run.finishedAt = new Date().toISOString()
-    await runs.put(run)
-    await lock.release(run.runId)
+    if (run.status === 'running') {
+      run.status = 'failed'
+      run.failed += 1
+      run.errors.push({ code: 'INTERNAL_ERROR', message: '扫描未正常完成，已标记为失败' })
+    }
+    try {
+      await runs.put(run)
+    } catch (error) {
+      console.error(JSON.stringify({
+        type: 'monitor_run_finalize_failed',
+        runId: run.runId,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    }
+    try {
+      await lock.release(run.runId)
+    } catch (error) {
+      console.error(JSON.stringify({
+        type: 'monitor_lock_release_failed',
+        runId: run.runId,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    }
   }
   return run
 }

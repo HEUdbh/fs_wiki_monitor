@@ -109,6 +109,7 @@ export interface RunError {
   code: string
   message: string
   documentToken?: string
+  recipientId?: string
 }
 
 export interface RunSummary extends StoredRecord {

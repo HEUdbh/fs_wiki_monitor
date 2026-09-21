@@ -35,6 +35,25 @@ export class RunRepository {
       .slice(0, 100)
   }
 
+  async markStaleRunning(maxAgeMs: number): Promise<void> {
+    const cutoff = Date.now() - maxAgeMs
+    const stale = (await this.list()).filter((run) => (
+      run.status === 'running' && new Date(run.startedAt).getTime() < cutoff
+    ))
+    for (const run of stale) {
+      await this.put({
+        ...run,
+        status: 'failed',
+        finishedAt: new Date().toISOString(),
+        failed: run.failed + 1,
+        errors: [
+          ...run.errors,
+          { code: 'INTERNAL_ERROR', message: '任务超过锁租期仍未完成，可能被 Worker 执行时限终止' },
+        ],
+      })
+    }
+  }
+
   putEvent(event: DocumentChangeEvent) {
     return this.kv.put(`event:${event.eventId}`, event, 60 * 60 * 24 * 90)
   }

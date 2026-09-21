@@ -1,0 +1,61 @@
+# Dependencies
+node_modules/
+.yarn/
+!.yarn/releases/
+
+# Build and generated files
+dist/
+dist-server/
+coverage/
+.vitest/
+worker-configuration.d.ts
+*.tsbuildinfo
+
+# Cloudflare local state and instance configuration
+.wrangler/
+wrangler.jsonc
+wrangler.local.jsonc
+wrangler.*.local.jsonc
+!wrangler.example.jsonc
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.local
+*.secret
+*.secrets
+credentials*
+secrets*
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editors
+.vscode/
+!.vscode/launch.json
+!.vscode/*.code-snippets
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini

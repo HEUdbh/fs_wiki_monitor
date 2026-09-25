@@ -101,7 +101,7 @@ cp wrangler.example.jsonc wrangler.jsonc
 ]
 ```
 
-- 按需要修改 `triggers.crons`，模板默认每 15 分钟执行一次。
+- 模板默认按 UTC 配置 Cron：上海时间每天 `09:00-22:00` 每 30 分钟执行监控，`22:30` 执行 KV 历史数据清理；手动扫描不受该时间段限制。
 
 自定义域名必须位于当前 Cloudflare 账号管理且已接入 Cloudflare 的 Zone 中；否则先使用 `workers.dev` 地址完成部署和 OAuth 配置。
 

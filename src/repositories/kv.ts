@@ -14,6 +14,12 @@ interface KVLike {
   list(options?: ListOptions): Promise<{ keys: Array<{ name: string }>; cursor?: string; list_complete: boolean }>
 }
 
+export interface KvKeyPage {
+  keys: string[]
+  cursor?: string
+  listComplete: boolean
+}
+
 const memory = new Map<string, { value: string; expiresAt?: number }>()
 
 const memoryKv: KVLike = {
@@ -36,11 +42,27 @@ const memoryKv: KVLike = {
     memory.delete(key)
   },
   async list(options = {}) {
-    const keys = [...memory.keys()]
+    const allKeys = [...memory.keys()]
       .filter((key) => !options.prefix || key.startsWith(options.prefix))
-      .slice(0, options.limit ?? 1000)
+      .sort()
+    const cursorIndex = options.cursor ? allKeys.indexOf(options.cursor) : -1
+    const start = cursorIndex >= 0
+      ? cursorIndex + 1
+      : options.cursor
+        ? allKeys.findIndex((key) => key > options.cursor!)
+        : 0
+    const normalizedStart = start >= 0 ? start : allKeys.length
+    const limit = Math.max(1, options.limit ?? 1000)
+    const keys = allKeys
+      .slice(normalizedStart, normalizedStart + limit)
       .map((name) => ({ name }))
-    return { keys, list_complete: true }
+    const nextOffset = normalizedStart + keys.length
+    const listComplete = nextOffset >= allKeys.length
+    return {
+      keys,
+      cursor: listComplete ? undefined : keys[keys.length - 1]?.name,
+      list_complete: listComplete,
+    }
   },
 }
 
@@ -105,6 +127,23 @@ export class KvRepository {
       cursor = result.cursor
     } while (cursor)
     return values
+  }
+
+  async listKeyPage(prefix: string, cursor?: string, limit = 1000): Promise<KvKeyPage> {
+    try {
+      const result = await this.kv.list({
+        prefix,
+        cursor,
+        limit: Math.min(1000, Math.max(1, limit)),
+      })
+      return {
+        keys: result.keys.map(({ name }) => name),
+        cursor: result.cursor,
+        listComplete: result.list_complete,
+      }
+    } catch (error) {
+      throw new Error(`KV read failed: ${error instanceof Error ? error.message : 'unknown error'}`)
+    }
   }
 
   async listKeys(prefix: string, limit = 1000): Promise<string[]> {

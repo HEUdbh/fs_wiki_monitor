@@ -9,8 +9,12 @@ export class RunRepository {
     this.kv = new KvRepository(env)
   }
 
+  private putRecord(run: RunSummary): Promise<void> {
+    return this.kv.put(`run:${run.runId}`, run, 60 * 60 * 24 * 30)
+  }
+
   async put(run: RunSummary): Promise<void> {
-    await this.kv.put(`run:${run.runId}`, run, 60 * 60 * 24 * 30)
+    await this.putRecord(run)
     await this.kv.put('run:latest', run)
   }
 
@@ -41,7 +45,7 @@ export class RunRepository {
       run.status === 'running' && new Date(run.startedAt).getTime() < cutoff
     ))
     for (const run of stale) {
-      await this.put({
+      await this.putRecord({
         ...run,
         status: 'failed',
         finishedAt: new Date().toISOString(),
@@ -52,6 +56,22 @@ export class RunRepository {
         ],
       })
     }
+  }
+
+  async markLatestStaleRunning(maxAgeMs: number): Promise<void> {
+    const run = await this.getLatest()
+    if (!run || run.status !== 'running') return
+    if (new Date(run.startedAt).getTime() >= Date.now() - maxAgeMs) return
+    await this.put({
+      ...run,
+      status: 'failed',
+      finishedAt: new Date().toISOString(),
+      failed: run.failed + 1,
+      errors: [
+        ...run.errors,
+        { code: 'INTERNAL_ERROR', message: '任务超过锁租期仍未完成，可能被 Worker 执行时限终止' },
+      ],
+    })
   }
 
   putEvent(event: DocumentChangeEvent) {

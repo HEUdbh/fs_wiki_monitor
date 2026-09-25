@@ -37,4 +37,21 @@ describe('KvRepository pagination', () => {
     const env = { FEISHU_MONITOR_KV: kv } as unknown as CloudflareBindings
     await expect(new KvRepository(env).listValues<{ id: number }>('event:')).resolves.toEqual([{ id: 1 }, { id: 2 }])
   })
+
+  it('exposes one paginated key page for maintenance jobs', async () => {
+    const kv = {
+      async get() { return null },
+      async put() {},
+      async delete() {},
+      async list() {
+        return { keys: [{ name: 'snapshot:1' }], cursor: 'next', list_complete: false }
+      },
+    }
+    const env = { FEISHU_MONITOR_KV: kv } as unknown as CloudflareBindings
+    await expect(new KvRepository(env).listKeyPage('snapshot:', undefined, 10)).resolves.toEqual({
+      keys: ['snapshot:1'],
+      cursor: 'next',
+      listComplete: false,
+    })
+  })
 })

@@ -40,4 +40,20 @@ describe('RunRepository', () => {
     const history = await repository.list()
     expect(history.map((item) => item.runId)).toEqual(['run_2', 'run_1'])
   })
+
+  it('repairs stale historical runs without replacing run:latest', async () => {
+    const repository = new RunRepository(env)
+    const stale = {
+      ...run('run_stale', new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()),
+      status: 'running' as const,
+      finishedAt: undefined,
+    }
+    await repository.put(stale)
+    await repository.put(run('run_latest', new Date().toISOString()))
+
+    await repository.markStaleRunning(60 * 60 * 1000)
+
+    await expect(repository.get('run_stale')).resolves.toMatchObject({ status: 'failed' })
+    await expect(repository.getLatest()).resolves.toMatchObject({ runId: 'run_latest' })
+  })
 })

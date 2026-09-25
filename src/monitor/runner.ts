@@ -17,6 +17,7 @@ import { FeishuClient } from '../feishu/client'
 import { ConfigRepository } from '../repositories/config'
 import { KvRepository } from '../repositories/kv'
 import { RunRepository } from '../repositories/runs'
+import { DATA_RETENTION_SECONDS } from '../maintenance/cleanup'
 import { MonitorLock } from './lock'
 import { renderTemplate } from './template'
 import { traverseWiki } from './traverse'
@@ -186,7 +187,7 @@ async function scanMonitor(
     for (const failedToken of query.failed) {
       run.errors.push({ code: 'DOCUMENT_METADATA_FAILED', message: '无法读取文档元数据', documentToken: failedToken })
       const previous = await kv.get<DocumentSnapshot>(snapshotKey(monitor.id, failedToken))
-      if (previous) {
+      if (previous && previous.status !== 'error') {
         await kv.put(snapshotKey(monitor.id, failedToken), {
           ...previous,
           status: 'error',
@@ -224,7 +225,7 @@ async function scanMonitor(
             return
           }
         } else if (previous.lastEditTime === lastEditTime || lastEditTime < previous.lastEditTime) {
-          await kv.put(key, snapshot)
+          if (previous.status !== 'active') await kv.put(key, snapshot)
           return
         }
 
@@ -259,7 +260,7 @@ async function scanMonitor(
         ...previous,
         status: 'removed',
         lastCheckedAt: new Date().toISOString(),
-      })
+      }, DATA_RETENTION_SECONDS)
     }
   }
 }
@@ -267,7 +268,7 @@ async function scanMonitor(
 export async function runWikiMonitor(env: CloudflareBindings, input: MonitorRunInput): Promise<RunSummary> {
   const runs = new RunRepository(env)
   const lockTtlSeconds = Math.max(60, Number(env.MONITOR_LOCK_TTL_SECONDS || 600))
-  await runs.markStaleRunning(lockTtlSeconds * 1000)
+  await runs.markLatestStaleRunning(lockTtlSeconds * 1000)
   const run: RunSummary = {
     schemaVersion: 1,
     runId: input.runId || randomId('run'),
